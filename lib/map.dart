@@ -26,12 +26,13 @@ class _MapWidget extends State<MapWidget> {
         options: MapOptions(
             center: widget.center ?? LatLng(43.7763331, 7.4733097),
             zoom: widget.zoom ?? 13,
-            maxZoom: 14,
+            maxZoom: 18,
             interactiveFlags: InteractiveFlag.drag |
                 InteractiveFlag.flingAnimation |
                 InteractiveFlag.pinchMove |
                 InteractiveFlag.pinchZoom |
-                InteractiveFlag.doubleTapZoom),
+                InteractiveFlag.doubleTapZoom |
+                InteractiveFlag.rotate),
         children: [widget.layerFactory(context)],
       )),
       Wrap(alignment: WrapAlignment.spaceBetween, children: [

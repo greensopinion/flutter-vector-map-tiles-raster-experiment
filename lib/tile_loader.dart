@@ -1,41 +1,77 @@
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutter_map/plugin_api.dart';
 import 'package:vector_map_raster/api_keys.dart';
+import 'package:executor_lib/executor_lib.dart';
 import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_tile_renderer/vector_tile_renderer.dart' hide TileLayer;
+import 'package:vector_map_tiles/src/grid/slippy_map_translator.dart';
+import 'package:vector_map_tiles/src/grid/grid_tile_positioner.dart';
+
+final _provider = MemoryCacheVectorTileProvider(
+    delegate: NetworkVectorTileProvider(
+        urlTemplate:
+            'https://tiles.stadiamaps.com/data/openmaptiles/{z}/{x}/{y}.pbf',
+        httpHeaders: {'Authorization': 'Stadia ${apiKeys()['stadia-maps']}'},
+        maximumZoom: 14),
+    maxSizeBytes: 2 * 1024 * 1024);
+
+final _executor = kDebugMode ? QueueExecutor() : PoolExecutor(concurrency: 4);
 
 Future<ImageInfo> tileLoader(Coords<num> coords, TileLayer options) async {
-  final provider = NetworkVectorTileProvider(
-      urlTemplate:
-          'https://tiles.stadiamaps.com/data/openmaptiles/{z}/{x}/{y}.pbf',
-      httpHeaders: {'Authorization': 'Stadia ${apiKeys()['stadia-maps']}'},
-      maximumZoom: 14);
-  final bytes = await provider.provide(
-      TileIdentity(coords.z.toInt(), coords.x.toInt(), coords.y.toInt()));
-  final tile = TileFactory(_theme, const Logger.noop())
-      .create(VectorTileReader().read(bytes));
-  final tileset = Tileset({'openmaptiles': tile});
+  final requestedTile =
+      TileIdentity(coords.z.toInt(), coords.x.toInt(), coords.y.toInt());
+  final translation =
+      SlippyMapTranslator(_provider.maximumZoom).translate(requestedTile);
+  final bytes = await _provider.provide(translation.translated);
+  final tileset = await _executor.submit(Job(
+      'tileset', _readTileset, _TilesetJob(bytes, coords.z.toInt().toDouble()),
+      deduplicationKey: requestedTile.key()));
+
   const scale = 2.0;
   final size = options.tileSize * scale;
+  final tileSizer = GridTileSizer(translation, scale, Size.square(size));
+
   final rect = Rect.fromLTRB(0, 0, size, size);
 
   final recorder = PictureRecorder();
   final canvas = Canvas(recorder, rect);
   canvas.clipRect(rect);
-  canvas.scale(scale.toDouble(), scale.toDouble());
+  double zoomScaleFactor;
+  if (tileSizer.effectiveScale == 1.0) {
+    canvas.scale(scale.toDouble(), scale.toDouble());
+    zoomScaleFactor = scale;
+  } else {
+    tileSizer.apply(canvas);
+    zoomScaleFactor = tileSizer.effectiveScale / scale;
+  }
 
   Renderer(theme: _theme).render(
     canvas,
     tileset,
-    zoomScaleFactor: 1.0,
+    zoomScaleFactor: zoomScaleFactor,
     zoom: coords.z.toInt().toDouble(),
   );
 
   final picture = recorder.endRecording();
   final image = await picture.toImage(size.toInt(), size.toInt());
   return ImageInfo(image: image, scale: scale);
+}
+
+class _TilesetJob {
+  final Uint8List bytes;
+  final double zoom;
+
+  _TilesetJob(this.bytes, this.zoom);
+}
+
+Future<Tileset> _readTileset(_TilesetJob job) async {
+  final tile = TileFactory(_theme, const Logger.noop())
+      .create(VectorTileReader().read(job.bytes));
+  final tileset = Tileset({'openmaptiles': tile});
+  return TilesetPreprocessor(_theme).preprocess(tileset, zoom: job.zoom);
 }
 
 final _theme = ThemeReader().read(_lightStyle());
@@ -1113,35 +1149,6 @@ dynamic _lightStyle() => {
             "text-halo-width": 1
           }
         },
-        {
-          "id": "housenumber",
-          "type": "symbol",
-          "source": "openmaptiles",
-          "source-layer": "housenumber",
-          "minzoom": 16.0,
-          "filter": [
-            "all",
-            ["==", "\$type", "Point"]
-          ],
-          "layout": {
-            "text-anchor": "top",
-            "text-field": "{housenumber}",
-            "text-font": ["Roboto Regular"],
-            "text-size": {
-              "base": 1,
-              "stops": [
-                [13, 12],
-                [14, 13],
-                [18, 16]
-              ]
-            }
-          },
-          "paint": {
-            "text-halo-color": "#fff",
-            "text-color": "#212121",
-            "text-halo-width": 1
-          }
-        }
       ],
       "id": "light"
     };

@@ -50,7 +50,7 @@ packages:
     source: hosted
     version: "1.0.5"
   executor_lib:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: executor_lib
       sha256: "0bd5c9fe0dfe0f6ab058c94515c387a169e518f94173e08a372d3ea8dd05def3"

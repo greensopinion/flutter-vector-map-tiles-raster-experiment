@@ -1,7 +1,10 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
+import 'package:flutter_isolate/flutter_isolate.dart';
 import 'package:flutter_map/plugin_api.dart';
 import 'package:vector_map_raster/api_keys.dart';
 import 'package:executor_lib/executor_lib.dart';
@@ -9,6 +12,30 @@ import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_tile_renderer/vector_tile_renderer.dart' hide TileLayer;
 import 'package:vector_map_tiles/src/grid/slippy_map_translator.dart';
 import 'package:vector_map_tiles/src/grid/grid_tile_positioner.dart';
+
+/*
+
+
+This is a hacked example showing two things:
+
+1. Rendering tiles as images then letting flutter_map do the rest
+
+This has the advantage of better performance and no jank when zooming/panning
+once tiles are loaded, since tiles are only rendered once for any given zoom
+level.
+
+2. Rendering tiles in a flutter_isolate, so off the main UI thread
+
+This eliminates jank caused by rendering tiles, since they are no longer rendered
+on the UI thread at all.
+
+Tile rendering is pretty slow using flutter_isolate, probably because a new isolate
+is launched for every tile.
+
+Relates to 
+https://github.com/greensopinion/flutter-vector-map-tiles/issues/120#issuecomment-1434949553
+
+ */
 
 final _provider = MemoryCacheVectorTileProvider(
     delegate: NetworkVectorTileProvider(
@@ -18,20 +45,71 @@ final _provider = MemoryCacheVectorTileProvider(
         maximumZoom: 14),
     maxSizeBytes: 2 * 1024 * 1024);
 
-final _executor = kDebugMode ? QueueExecutor() : PoolExecutor(concurrency: 4);
+var _inFlutterIsolate = false;
+Executor? __executor;
+Executor _executor() {
+  __executor ??= _inFlutterIsolate || kDebugMode
+      ? QueueExecutor()
+      : PoolExecutor(concurrency: 4);
+  return __executor!;
+}
+
+final _useUiIsolates = false && (Platform.isIOS || Platform.isAndroid);
 
 Future<ImageInfo> tileLoader(Coords<num> coords, TileLayer options) async {
-  final requestedTile =
-      TileIdentity(coords.z.toInt(), coords.x.toInt(), coords.y.toInt());
+  const scale = 2.0;
+  if (_useUiIsolates) {
+    final bytes = await flutterCompute(_loadTileImageBytesCompute, {
+      'tileSize': options.tileSize,
+      'scale': scale,
+      'x': coords.x.toInt(),
+      'y': coords.y.toInt(),
+      'z': coords.z.toInt()
+    });
+    final completer = Completer<ImageInfo>();
+    final size = (options.tileSize * scale).toInt();
+    decodeImageFromPixels(bytes, size, size, PixelFormat.rgba8888, (image) {
+      completer.complete(ImageInfo(image: image, scale: scale));
+    });
+    return await completer.future;
+  } else {
+    final image = await _loadTileImage(options.tileSize, scale,
+        coords.x.toInt(), coords.y.toInt(), coords.z.toInt());
+    return ImageInfo(image: image, scale: scale);
+  }
+}
+
+@pragma('vm:entry-point')
+Future<Uint8List> _loadTileImageBytesCompute(Map args) {
+  _inFlutterIsolate = true;
+  return _loadTileImageBytes(
+      args['tileSize'], args['scale'], args['x'], args['y'], args['z']);
+}
+
+Future<Uint8List> _loadTileImageBytes(
+    double tileSize, double scale, int x, int y, int z) async {
+  final image = await _loadTileImage(tileSize, scale, x, y, z);
+  try {
+    return (await image.toByteData(format: ImageByteFormat.rawRgba))!
+        .buffer
+        .asUint8List();
+  } finally {
+    image.dispose();
+  }
+}
+
+Future<Image> _loadTileImage(
+    double tileSize, double scale, int x, int y, int z) async {
+  final requestedTile = TileIdentity(z, x, y);
   final translation =
       SlippyMapTranslator(_provider.maximumZoom).translate(requestedTile);
   final bytes = await _provider.provide(translation.translated);
-  final tileset = await _executor.submit(Job(
-      'tileset', _readTileset, _TilesetJob(bytes, coords.z.toInt().toDouble()),
+  final tileset = await _executor().submit(Job(
+      'tileset', _readTileset, _TilesetJob(bytes, z.toDouble()),
       deduplicationKey: requestedTile.key()));
 
   const scale = 2.0;
-  final size = options.tileSize * scale;
+  final size = tileSize * scale;
   final tileSizer = GridTileSizer(translation, scale, Size.square(size));
 
   final rect = Rect.fromLTRB(0, 0, size, size);
@@ -52,12 +130,11 @@ Future<ImageInfo> tileLoader(Coords<num> coords, TileLayer options) async {
     canvas,
     tileset,
     zoomScaleFactor: zoomScaleFactor,
-    zoom: coords.z.toInt().toDouble(),
+    zoom: z.toDouble(),
   );
 
   final picture = recorder.endRecording();
-  final image = await picture.toImage(size.toInt(), size.toInt());
-  return ImageInfo(image: image, scale: scale);
+  return await picture.toImage(size.toInt(), size.toInt());
 }
 
 class _TilesetJob {
